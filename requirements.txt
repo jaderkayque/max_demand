@@ -1,0 +1,6 @@
+# Dependências do núcleo de ML da Demanda Máxima Estrutural.
+# No Databricks, Spark e o conector JDBC do SQL Server já vêm no cluster;
+# instale apenas estes (via %pip install -r ou na config do cluster).
+torch>=2.0
+numpy>=1.24
+pandas>=2.0
