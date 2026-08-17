@@ -105,6 +105,40 @@ def alinhar_comprimento(ano, mes, uf, ativo, comp_map, dcomp_map, cfg: ConfigMul
     return comp_norm.astype(np.float32), dcomp_norm.astype(np.float32)
 
 
+def montar_janelas_grupo(valor, datas, regiao, ativo, ano, comp_map, dcomp_map,
+                         cfg: ConfigMulti, max_janelas: int | None = None,
+                         seed_extra: int = 0):
+    """
+    Monta as janelas [n, L] de UM alimentador-ano: valor normalizado (RobustScaler
+    do próprio grupo), comp e d_comp alinhados ao mês. Se `max_janelas` for dado,
+    amostra aleatoriamente no máximo esse número de janelas, com semente derivada
+    da CHAVE do grupo (crc32) — reprodutível e independente da ordem/partição.
+
+    Pensado para rodar DENTRO de `applyInPandas` (workers Spark): trazer a série
+    bruta inteira ao driver com `.toPandas()` estoura `spark.driver.maxResultSize`;
+    janelas float32 amostradas são ~20x menores que as linhas cruas.
+
+    Retorna (vw, cw, dw) float32 ou None se a série for menor que L.
+    """
+    import zlib
+    import pandas as pd
+    valor = np.asarray(valor, dtype=float)
+    if valor.size < cfg.L:
+        return None
+    sc = core.RobustScaler().fit(valor)
+    d = pd.DatetimeIndex(pd.to_datetime(datas))   # aceita Series ou DatetimeIndex
+    comp_full, dcomp_full = alinhar_comprimento(d.year, d.month, regiao, ativo,
+                                                comp_map, dcomp_map, cfg)
+    W = lambda a: core.make_windows(a, cfg.L, cfg.L)
+    vw, cw, dw = W(sc.transform(valor)), W(comp_full), W(dcomp_full)
+    if max_janelas is not None and vw.shape[0] > max_janelas:
+        chave = f"{regiao}|{ativo}|{int(ano)}".encode()
+        rng = np.random.default_rng(cfg.seed + seed_extra + zlib.crc32(chave))
+        idx = rng.choice(vw.shape[0], size=max_janelas, replace=False)
+        vw, cw, dw = vw[idx], cw[idx], dw[idx]
+    return vw.astype(np.float32), cw.astype(np.float32), dw.astype(np.float32)
+
+
 # =============================================================================
 # 3. Construção de canais (numpy)
 # =============================================================================

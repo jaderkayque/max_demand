@@ -27,7 +27,8 @@ import sys
 import numpy as np
 import pandas as pd
 from pyspark.sql.functions import lit, rand
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType
+from pyspark.sql.types import (StructType, StructField, StringType, IntegerType,
+                               DoubleType, BinaryType)
 
 sys.path.insert(0, "/Workspace/Repos/james/scripts_python/demanda_maxima")
 import core, core_multi as cm            # noqa: E402
@@ -39,6 +40,7 @@ dbutils.widgets.text("model_h0_path", "/dbfs/FileStore/james/demanda_maxima/ae_h
 dbutils.widgets.text("model_h1_path", "/dbfs/FileStore/james/demanda_maxima/ae_h1_multi.pt")
 dbutils.widgets.text("secret_scope", "james")
 dbutils.widgets.text("n_pool", "200")
+dbutils.widgets.text("max_janelas_pool", "40")   # janelas (dias) por alimentador-ano do pool
 
 MEDICAO   = dbutils.widgets.get("medicao_path")
 GRANDEZA  = dbutils.widgets.get("grandeza")
@@ -46,6 +48,7 @@ H0_PATH   = dbutils.widgets.get("model_h0_path")
 H1_PATH   = dbutils.widgets.get("model_h1_path")
 SCOPE     = dbutils.widgets.get("secret_scope")
 N_POOL    = int(dbutils.widgets.get("n_pool"))
+MAX_JANELAS_POOL = int(dbutils.widgets.get("max_janelas_pool"))
 
 url, props = io.jdbc_conf(dbutils, SCOPE)
 
@@ -101,26 +104,43 @@ for _, r in lb.iterrows():
 print("exemplos rotulados prontos:", len(rotulados))
 
 # COMMAND ----------
-# MAGIC %md ## 3. Pool de reconstrução (amostra aleatória com semente) e FINE-TUNING
+# MAGIC %md ## 3. Pool de reconstrução (janelas montadas NOS WORKERS) e FINE-TUNING
+# MAGIC Trazer a série bruta ao driver (`.toPandas()`) estoura
+# MAGIC `spark.driver.maxResultSize`; cada grupo monta e amostra suas janelas no
+# MAGIC worker (`core_multi.montar_janelas_grupo`) e devolve blobs float32.
 
 # COMMAND ----------
 # amostra ALEATÓRIA do pool, com semente registrada (`.limit(N)` puro tem viés)
 ativos = [x.ativo for x in (med.select("ativo").distinct()
                                .orderBy(rand(seed=cfg.seed)).limit(N_POOL).collect())]
-pool_pdf = (med.filter(med.ativo.isin(ativos))
-               .select("regiao", "ativo", "ano", "DATAS", "valor")
-               .orderBy("ativo", "ano", "DATAS").toPandas())
-pv, pc, pdc = [], [], []
-for (reg, at, ano), g in pool_pdf.groupby(["regiao", "ativo", "ano"]):
-    v = g["valor"].to_numpy(float)
-    if v.size < cfg.L:
-        continue
-    sc = core.RobustScaler().fit(v)
-    comp_full, dcomp_full = canais_comp(g["DATAS"], reg, at)
-    pv.append(core.make_windows(sc.transform(v), cfg.L, cfg.L))
-    pc.append(core.make_windows(comp_full, cfg.L, cfg.L))
-    pdc.append(core.make_windows(dcomp_full, cfg.L, cfg.L))
-pool = {"valor": np.concatenate(pv), "comp": np.concatenate(pc), "dcomp": np.concatenate(pdc)}
+amostra_pool = med.filter(med.ativo.isin(ativos))
+
+win_schema = StructType([StructField("valor_w", BinaryType()),
+                         StructField("comp_w", BinaryType()),
+                         StructField("dcomp_w", BinaryType())])
+
+def montar_janelas_pool(pdf: pd.DataFrame) -> pd.DataFrame:
+    import numpy as _np, core_multi as _cm
+    pdf = pdf.sort_values("DATAS")
+    r = pdf.iloc[0]
+    res = _cm.montar_janelas_grupo(pdf["valor"].to_numpy(float), pdf["DATAS"],
+                                   r["regiao"], r["ativo"], int(r["ano"]),
+                                   COMP_MAP, DCOMP_MAP, cfg,
+                                   max_janelas=MAX_JANELAS_POOL, seed_extra=1)
+    if res is None:
+        return pd.DataFrame(columns=["valor_w", "comp_w", "dcomp_w"])
+    vw, cw, dw = res
+    return pd.DataFrame({"valor_w": [vw.tobytes()], "comp_w": [cw.tobytes()],
+                         "dcomp_w": [dw.tobytes()]})
+
+linhas = (amostra_pool.groupBy("regiao", "ativo", "ano")
+                      .applyInPandas(montar_janelas_pool, schema=win_schema).collect())
+
+def _des(col):
+    return np.concatenate([np.frombuffer(r[col], dtype=np.float32).reshape(-1, cfg.L)
+                           for r in linhas])
+
+pool = {"valor": _des("valor_w"), "comp": _des("comp_w"), "dcomp": _des("dcomp_w")}
 
 model_h1 = cm.fine_tune_h1(model, rotulados, pool, cfg,
                            lam=8.0, epochs=60, lr=5e-4, rot_batch=16)

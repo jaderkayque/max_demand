@@ -23,12 +23,14 @@ import databricks_io_v2 as io               # noqa: E402
 dbutils.widgets.text("medicao_path", "/Volumes/poseidon_uc/group_uc/ddpe/medicao/parquet")
 dbutils.widgets.text("grandeza", "IMAX")
 dbutils.widgets.text("n_alimentadores_amostra", "300")
+dbutils.widgets.text("max_janelas_por_grupo", "60")   # janelas (dias) por alimentador-ano
 dbutils.widgets.text("model_path", "/Workspace/Shared/Servidores/Servidor SP/James/ML_Demanda_Maxima/ae_h0_multi.pt")
 dbutils.widgets.text("secret_scope", "sqlserver")
 
 MEDICAO    = dbutils.widgets.get("medicao_path")
 GRANDEZA   = dbutils.widgets.get("grandeza")
 N_SAMPLE   = int(dbutils.widgets.get("n_alimentadores_amostra"))
+MAX_JANELAS = int(dbutils.widgets.get("max_janelas_por_grupo"))
 MODEL_PATH = dbutils.widgets.get("model_path")
 SCOPE      = dbutils.widgets.get("secret_scope")
 
@@ -46,13 +48,13 @@ def ler_alm(regiao):
     return df.selectExpr("regiao", "ALM as ativo", "DATAS",
                          f"{GRANDEZA} as valor", "YEAR as ano")
 
-def canais_comp(datas, regiao, ativo):
-    d = pd.to_datetime(datas)
-    return cm.alinhar_comprimento(d.dt.year, d.dt.month, regiao, ativo, COMP_MAP, DCOMP_MAP, cfg)
-
 # COMMAND ----------
 
-# MAGIC %md ## 1. Amostra de alimentadores e montagem dos canais (por alimentador-ano)
+# MAGIC %md ## 1. Amostra de alimentadores e montagem das janelas NOS WORKERS
+# MAGIC Trazer a série bruta ao driver (`.toPandas()`) estoura
+# MAGIC `spark.driver.maxResultSize` (timestamps + strings por linha). Em vez disso,
+# MAGIC cada (regiao, ativo, ano) monta e AMOSTRA suas janelas no worker
+# MAGIC (`core_multi.montar_janelas_grupo`) e devolve só blobs float32 compactos.
 
 # COMMAND ----------
 
@@ -61,25 +63,36 @@ med = ler_alm("SP").unionByName(ler_alm("ES"), allowMissingColumns=True)
 # amostra ALEATÓRIA de alimentadores, com semente registrada
 # (`.limit(N)` sem ordenação devolve "os N primeiros do Spark" — viés de seleção)
 from pyspark.sql.functions import rand
+from pyspark.sql.types import StructType, StructField, BinaryType
 ativos = [r.ativo for r in (med.select("ativo").distinct()
                                .orderBy(rand(seed=cfg.seed)).limit(N_SAMPLE).collect())]
 amostra = med.filter(med.ativo.isin(ativos))
-pdf = (amostra.orderBy("regiao", "ativo", "ano", "DATAS")
-              .select("regiao", "ativo", "ano", "DATAS", "valor").toPandas())
 
-W = lambda a: core.make_windows(a, cfg.L, cfg.L)
-valor_w, comp_w, dcomp_w = [], [], []
-for (reg, at, ano), g in pdf.groupby(["regiao", "ativo", "ano"]):
-    v = g["valor"].to_numpy(float)
-    if v.size < cfg.L:
-        continue
-    sc = core.RobustScaler().fit(v)                       # escala por alimentador-ano
-    comp_full, dcomp_full = canais_comp(g["DATAS"], reg, at)   # extensão alinhada ao mês
-    valor_w.append(W(sc.transform(v)))
-    comp_w.append(W(comp_full)); dcomp_w.append(W(dcomp_full))
+win_schema = StructType([StructField("valor_w", BinaryType()),
+                         StructField("comp_w", BinaryType()),
+                         StructField("dcomp_w", BinaryType())])
 
-valor_w = np.concatenate(valor_w)
-comp_w = np.concatenate(comp_w); dcomp_w = np.concatenate(dcomp_w)
+def montar_janelas(pdf: pd.DataFrame) -> pd.DataFrame:
+    import numpy as _np, core_multi as _cm
+    pdf = pdf.sort_values("DATAS")
+    r = pdf.iloc[0]
+    res = _cm.montar_janelas_grupo(pdf["valor"].to_numpy(float), pdf["DATAS"],
+                                   r["regiao"], r["ativo"], int(r["ano"]),
+                                   COMP_MAP, DCOMP_MAP, cfg, max_janelas=MAX_JANELAS)
+    if res is None:
+        return pd.DataFrame(columns=["valor_w", "comp_w", "dcomp_w"])
+    vw, cw, dw = res
+    return pd.DataFrame({"valor_w": [vw.tobytes()], "comp_w": [cw.tobytes()],
+                         "dcomp_w": [dw.tobytes()]})
+
+linhas = (amostra.groupBy("regiao", "ativo", "ano")
+                 .applyInPandas(montar_janelas, schema=win_schema).collect())
+
+def _des(col):
+    return np.concatenate([np.frombuffer(r[col], dtype=np.float32).reshape(-1, cfg.L)
+                           for r in linhas])
+
+valor_w, comp_w, dcomp_w = _des("valor_w"), _des("comp_w"), _des("dcomp_w")
 print("janelas de treino:", valor_w.shape, "| canais:", cfg.n_canais)
 
 # COMMAND ----------
