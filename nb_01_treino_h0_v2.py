@@ -1,9 +1,10 @@
 # Databricks notebook source
 # MAGIC %md
 # MAGIC # nb_01 — Treino do H0 MULTIVARIADO (autoencoder denoising condicional)
-# MAGIC Canais por janela diária: **valor, is_sicoi, derivada, desvio**;
-# MAGIC estático (no gargalo): **comprimento_rede** (de `james.EXT_REDE_MT`, por ano).
-# MAGIC Perda de reconstrução **mascarada por is_sicoi**. Salva o artefato p/ o nb_02.
+# MAGIC Canais por janela diária: **valor, derivada, desvio, comp, d_comp**
+# MAGIC (extensão mensal do circuito de `james.EXT_REDE_MT`).
+# MAGIC `is_sicoi` foi removido do pipeline (decisão de projeto) — sem máscara de
+# MAGIC perda; a perda é L1 simples. Salva o artefato p/ o nb_02.
 
 # COMMAND ----------
 
@@ -43,7 +44,7 @@ print(f"extensao: {len(COMP_MAP)} chaves | media={cfg.comp_mean:.2f} std={cfg.co
 def ler_alm(regiao):
     df = spark.read.parquet(f"{MEDICAO}/{regiao}/ALM").withColumn("regiao", lit(regiao))
     return df.selectExpr("regiao", "ALM as ativo", "DATAS",
-                         f"{GRANDEZA} as valor", "is_sicoi", "YEAR as ano")
+                         f"{GRANDEZA} as valor", "YEAR as ano")
 
 def canais_comp(datas, regiao, ativo):
     d = pd.to_datetime(datas)
@@ -57,24 +58,28 @@ def canais_comp(datas, regiao, ativo):
 
 med = ler_alm("SP").unionByName(ler_alm("ES"), allowMissingColumns=True)
 
-ativos = [r.ativo for r in med.select("ativo").distinct().limit(N_SAMPLE).collect()]
+# amostra ALEATÓRIA de alimentadores, com semente registrada
+# (`.limit(N)` sem ordenação devolve "os N primeiros do Spark" — viés de seleção)
+from pyspark.sql.functions import rand
+ativos = [r.ativo for r in (med.select("ativo").distinct()
+                               .orderBy(rand(seed=cfg.seed)).limit(N_SAMPLE).collect())]
 amostra = med.filter(med.ativo.isin(ativos))
 pdf = (amostra.orderBy("regiao", "ativo", "ano", "DATAS")
-              .select("regiao", "ativo", "ano", "DATAS", "valor", "is_sicoi").toPandas())
+              .select("regiao", "ativo", "ano", "DATAS", "valor").toPandas())
 
 W = lambda a: core.make_windows(a, cfg.L, cfg.L)
-valor_w, sic_w, comp_w, dcomp_w = [], [], [], []
+valor_w, comp_w, dcomp_w = [], [], []
 for (reg, at, ano), g in pdf.groupby(["regiao", "ativo", "ano"]):
     v = g["valor"].to_numpy(float)
     if v.size < cfg.L:
         continue
     sc = core.RobustScaler().fit(v)                       # escala por alimentador-ano
     comp_full, dcomp_full = canais_comp(g["DATAS"], reg, at)   # extensão alinhada ao mês
-    valor_w.append(W(sc.transform(v))); sic_w.append(W(g["is_sicoi"].fillna(0).to_numpy(float)))
+    valor_w.append(W(sc.transform(v)))
     comp_w.append(W(comp_full)); dcomp_w.append(W(dcomp_full))
 
-valor_w = np.concatenate(valor_w); sic_w = np.concatenate(sic_w)
-comp_w = np.concatenate(comp_w); dcomp_w = np.concatenate(dcomp_w) 
+valor_w = np.concatenate(valor_w)
+comp_w = np.concatenate(comp_w); dcomp_w = np.concatenate(dcomp_w)
 print("janelas de treino:", valor_w.shape, "| canais:", cfg.n_canais)
 
 # COMMAND ----------
@@ -83,7 +88,7 @@ print("janelas de treino:", valor_w.shape, "| canais:", cfg.n_canais)
 
 # COMMAND ----------
 
-model = cm.train_h0_multi(valor_w, sic_w, comp_w, dcomp_w, cfg)
+model = cm.train_h0_multi(valor_w, comp_w, dcomp_w, cfg)
 
 os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)   # se /dbfs não acessível, use uma Volume
 cm.salvar_modelo(model, MODEL_PATH, cfg, VERSAO)          # cfg guarda comp_mean/comp_std

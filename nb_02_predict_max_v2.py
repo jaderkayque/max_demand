@@ -38,7 +38,7 @@ url, props = io.jdbc_conf(dbutils, SCOPE)
 def ler_alm(regiao):
     df = spark.read.parquet(f"{MEDICAO}/{regiao}/ALM").withColumn("regiao", lit(regiao))
     return df.selectExpr("regiao", "ALM as ativo", "DATAS",
-                         f"{GRANDEZA} as valor", "is_sicoi", "YEAR as ano")
+                         f"{GRANDEZA} as valor", "YEAR as ano")
 
 
 # versão + cfg (com stats de extensão) e os mapas mensais de extensão — no driver
@@ -72,13 +72,12 @@ def calcular_maxima(pdf: pd.DataFrame) -> pd.DataFrame:
     m, cfg = _modelo()
     pdf = pdf.sort_values("DATAS")
     valor = pdf["valor"].to_numpy(float)
-    sic   = pdf["is_sicoi"].fillna(0).to_numpy(float)
     sc = _core.RobustScaler().fit(valor)
     r = pdf.iloc[0]
     d = _pd.to_datetime(pdf["DATAS"])
     comp_full, dcomp_full = _cm.alinhar_comprimento(d.dt.year, d.dt.month,
                                                     r["regiao"], r["ativo"], COMP_MAP, DCOMP_MAP, cfg)
-    v = _cm.maxima_anual_multi(m, valor, sic, comp_full, dcomp_full, sc, cfg)
+    v = _cm.maxima_anual_multi(m, valor, comp_full, dcomp_full, sc, cfg)
     return pd.DataFrame([{
         "regiao": r["regiao"], "tipo": "Alimentador", "ativo": r["ativo"],
         "grandeza": GRANDEZA, "ano": int(r["ano"]),
