@@ -49,8 +49,11 @@ df = (ler_alm("SP")
 
 # COMMAND ----------
 
-# amostra de alimentadores para o treino global
-ativos = [r.ativo for r in df.select("ativo").distinct().limit(N_SAMPLE).collect()]
+# amostra ALEATÓRIA de alimentadores para o treino global, com semente registrada
+# (`.limit(N)` sem ordenação devolve "os N primeiros do Spark" — viés de seleção)
+from pyspark.sql.functions import rand
+ativos = [r.ativo for r in (df.select("ativo").distinct()
+                              .orderBy(rand(seed=cfg.seed)).limit(N_SAMPLE).collect())]
 amostra = df.filter(df.ativo.isin(ativos))
 
 # traz para o driver (série por alimentador) e monta janelas normalizadas

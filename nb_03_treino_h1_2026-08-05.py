@@ -3,11 +3,16 @@
 # MAGIC # nb_03 — Cálculo do H1 (incorpora o conhecimento do especialista)
 # MAGIC Lê os rótulos do engenheiro em `james.DEMANDA_MAXIMA_TREINO`, aprende uma
 # MAGIC calibração global a partir dos pares (H0, valor_correto) e a aplica a todos
-# MAGIC os alimentadores. Onde há rótulo, usa o valor exato do especialista.
+# MAGIC os alimentadores.
+# MAGIC
+# MAGIC **Avaliação honesta:** a qualidade da calibração é medida por validação
+# MAGIC cruzada AGRUPADA POR ALIMENTADOR (out-of-sample). A regra de produção
+# MAGIC "onde há rótulo, usa o valor exato do especialista" NUNCA entra na
+# MAGIC avaliação — métricas calculadas sobre pares usados no ajuste são circulares.
 # MAGIC Grava `demanda_max_h1` em `james.DEMANDA_MAXIMA`.
 
 # COMMAND ----------
-# MAGIC %pip install numpy pandas
+# MAGIC %pip install numpy pandas pymssql
 
 # COMMAND ----------
 import sys
@@ -19,6 +24,7 @@ import databricks_io as io  # noqa: E402
 
 dbutils.widgets.text("secret_scope", "james")
 SCOPE = dbutils.widgets.get("secret_scope")
+SEED = 42  # semente registrada — folds reprodutíveis
 url, props = io.jdbc_conf(dbutils, SCOPE)
 
 # COMMAND ----------
@@ -36,25 +42,72 @@ lb = (lb.sort_values("timestamp").groupby(chaves, as_index=False)
 base = dm.merge(lb, on=chaves, how="left")
 
 # COMMAND ----------
-# MAGIC %md ## 2. Calibração global aprendida dos pares (H0 → valor_correto)
+# MAGIC %md ## 2. Avaliação out-of-sample da calibração (K-fold agrupado por alimentador)
 
 # COMMAND ----------
-pares = base.dropna(subset=["demanda_max_h0", "valor_correto"])
-a, b = 1.0, 0.0
-if len(pares) >= 2:
-    # ajuste robusto simples: h1 = a*h0 + b (mínimos quadrados)
-    a, b = np.polyfit(pares["demanda_max_h0"].to_numpy(float),
-                      pares["valor_correto"].to_numpy(float), 1)
+pares = base.dropna(subset=["demanda_max_h0", "valor_correto"]).copy()
+
+
+def _ajustar(tr):
+    """h1 = a*h0 + b por mínimos quadrados sobre o conjunto de treino."""
+    if len(tr) < 2:
+        return 1.0, 0.0
+    return np.polyfit(tr["demanda_max_h0"].to_numpy(float),
+                      tr["valor_correto"].to_numpy(float), 1)
+
+
+def cv_calibracao(pares: pd.DataFrame, k: int = 5, seed: int = SEED) -> pd.DataFrame:
+    """K-fold AGRUPADO por alimentador: anos do mesmo alimentador são
+    correlacionados e devem cair no mesmo fold, senão o erro é subestimado."""
+    rng = np.random.default_rng(seed)
+    ativos = pares["ativo"].unique().copy()
+    rng.shuffle(ativos)
+    folds = np.array_split(ativos, k)
+    out = []
+    for f in folds:
+        te = pares["ativo"].isin(f)
+        if te.sum() == 0 or (~te).sum() < 2:
+            continue
+        a, b = _ajustar(pares[~te])
+        pred = a * pares.loc[te, "demanda_max_h0"].to_numpy(float) + b
+        real = pares.loc[te, "valor_correto"].to_numpy(float)
+        out.append(pd.DataFrame({"regiao": pares.loc[te, "regiao"],
+                                 "ativo": pares.loc[te, "ativo"],
+                                 "ano": pares.loc[te, "ano"],
+                                 "pred": pred, "real": real}))
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
+
+
+if len(pares) >= 10:
+    cv = cv_calibracao(pares)
+    err = cv["pred"] - cv["real"]
+    rel = np.abs(err) / np.abs(cv["real"])
+    print(f"[CV agrupada, n={len(cv)}]  MAE={np.abs(err).mean():.3f}  "
+          f"MdAPE={np.median(rel) * 100:.2f}%  "
+          f"HR_5%={(rel <= 0.05).mean() * 100:.1f}%  HR_10%={(rel <= 0.10).mean() * 100:.1f}%")
+    # recorte por estado — a média global esconde os casos difíceis
+    for reg, g in cv.assign(rel=rel).groupby("regiao"):
+        print(f"  {reg}: n={len(g)}  MdAPE={np.median(g['rel']) * 100:.2f}%  "
+              f"HR_10%={(g['rel'] <= 0.10).mean() * 100:.1f}%")
+else:
+    print(f"AVISO: apenas {len(pares)} pares rotulados — CV pouco informativa.")
+
+# COMMAND ----------
+# MAGIC %md ## 3. Calibração final (todos os pares) — uso EXCLUSIVO de produção
+
+# COMMAND ----------
+a, b = _ajustar(pares)
 print(f"calibracao H1: h1 = {a:.3f} * h0 + {b:.3f}  (n_rotulos={len(pares)})")
 
 h1 = a * base["demanda_max_h0"].to_numpy(float) + b
-# onde há rótulo do especialista, usa o valor EXATO informado (ground truth)
+# regra de PRODUÇÃO: onde há rótulo do especialista, usa o valor exato informado.
+# (Nunca usar estes pares em avaliação — ver seção 2.)
 tem_rotulo = base["valor_correto"].notna().to_numpy()
 h1[tem_rotulo] = base["valor_correto"].to_numpy(float)[tem_rotulo]
 base["demanda_max_h1"] = h1
 
 # COMMAND ----------
-# MAGIC %md ## 3. Grava demanda_max_h1 (staging + MERGE)
+# MAGIC %md ## 4. Grava demanda_max_h1 (staging + MERGE)
 
 # COMMAND ----------
 stg = base[["regiao", "ativo", "grandeza", "ano", "demanda_max_h1"]]
@@ -67,5 +120,5 @@ USING james.DEMANDA_MAXIMA_H1_STG AS s
   ON d.regiao=s.regiao AND d.ativo=s.ativo AND d.grandeza=s.grandeza AND d.ano=s.ano
 WHEN MATCHED THEN UPDATE SET d.demanda_max_h1 = s.demanda_max_h1, d.calculado_em = GETDATE();
 """
-io.executar_sql(spark, url, props, MERGE)
+io.executar_sql_pymssql(MERGE, dbutils, scope=SCOPE)
 print("H1 atualizado em james.DEMANDA_MAXIMA")

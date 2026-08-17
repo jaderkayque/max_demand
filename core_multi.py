@@ -3,17 +3,22 @@ core_multi.py — H0 MULTIVARIADO + retreino H1 guiado pelo especialista.
 
 Canais por janela diária:
     0 valor      (grandeza, normalizado)
-    1 is_sicoi   (manobra OPERACIONAL conhecida, 0/1) — evento TEMPORÁRIO
-    2 derivada   (np.gradient do valor) — realça picos/transições
-    3 desvio     (desvio-padrão local) — realça instabilidade
-    4 comp       (extensão do circuito em km, mensal, normalizada) — TOPOLOGIA
-    5 d_comp     (variação mês-a-mês da extensão) — flag de MANOBRA TOPOLÓGICA
+    1 derivada   (np.gradient do valor) — realça picos/transições
+    2 desvio     (desvio-padrão local) — realça instabilidade
+    3 comp       (extensão do circuito em km, mensal, normalizada) — TOPOLOGIA
+    4 d_comp     (variação mês-a-mês da extensão) — flag de MANOBRA TOPOLÓGICA
 
-Ideia causal: um Δkm grande (canal 5) marca uma reconfiguração PERMANENTE da rede
+NOTA (decisão de projeto): o canal `is_sicoi` (registro de manobra operacional)
+foi REMOVIDO do pipeline, junto com a máscara de perda que dependia dele. O
+conhecimento de domínio embutido via features fica restrito à topologia
+(comp/d_comp); a separação entre evento operacional temporário e mudança
+estrutural passa a depender apenas do objetivo denoising + supervisão do
+especialista (H1).
+
+Ideia causal: um Δkm grande (canal 4) marca uma reconfiguração PERMANENTE da rede
 que deve refletir num novo patamar de demanda — mudança ESTRUTURAL, que o H0 deve
-preservar. Já `is_sicoi` marca evento OPERACIONAL temporário, que a perda de
-reconstrução IGNORA (mascarado). Assim a rede aprende a separar mudança estrutural
-(Δkm) de perturbação transitória (is_sicoi).
+preservar. Perturbações transitórias (manobras, erros) são atenuadas pelo
+objetivo denoising (contaminação sintética + perda L1 robusta).
 
 Saída = 1 canal (reconstrução estrutural do valor).
 H1 = FINE-TUNING com perda de quantil anual (soft-peak) guiada pelo engenheiro.
@@ -48,7 +53,7 @@ except Exception:
 class ConfigMulti:
     L: int = 144
     latent: int = 32
-    n_canais: int = 6          # valor, is_sicoi, derivada, desvio, comp, d_comp
+    n_canais: int = 5          # valor, derivada, desvio, comp, d_comp
     n_static: int = 0          # sem estático (a extensão virou canal temporal)
     k_desvio: int = 7
     comp_mean: float = 0.0     # normalização do nível de extensão (km) — salvos no modelo
@@ -57,7 +62,7 @@ class ConfigMulti:
     epochs: int = 40
     batch_size: int = 128
     lr: float = 1e-3
-    prob_max: float = 0.999
+    prob_max: float = 0.999    # HIPERPARÂMETRO: tunar em validação interna, nunca no teste
     tau: float = 0.05
     seed: int = 42
     p_plato: float = 0.5
@@ -84,6 +89,8 @@ def alinhar_comprimento(ano, mes, uf, ativo, comp_map, dcomp_map, cfg: ConfigMul
     devolve (comp_norm, d_comp_norm) — nível e variação mês-a-mês normalizados.
     Faltando o dado, comp=média (0 normalizado) e d_comp=0.
     comp_map/dcomp_map: {(UF, ativo, ANO, MES): valor_km}.
+    Limitação de observabilidade: o cadastro é mensal — reconfigurações que não
+    sobrevivem à fotografia mensal não aparecem nestes canais.
     """
     ano = np.asarray(ano); mes = np.asarray(mes)
     comp = np.array([comp_map.get((uf, ativo, int(a), int(m)), np.nan)
@@ -114,12 +121,12 @@ def _rolling_std(v: np.ndarray, k: int) -> np.ndarray:
     return np.sqrt(np.clip(m2 - m ** 2, 0, None))[..., :x.shape[ax]]
 
 
-def canais_de_janelas(valor_w, sic_w, comp_w, dcomp_w, cfg: ConfigMulti) -> np.ndarray:
-    """De janelas [N,L] de valor/is_sicoi/comp/d_comp monta [N, 6, L]."""
+def canais_de_janelas(valor_w, comp_w, dcomp_w, cfg: ConfigMulti) -> np.ndarray:
+    """De janelas [N,L] de valor/comp/d_comp monta [N, 5, L]."""
     valor_w = np.asarray(valor_w, np.float32)
     deriv = np.gradient(valor_w, axis=-1).astype(np.float32)
     desvio = _rolling_std(valor_w, cfg.k_desvio).astype(np.float32)
-    return np.stack([valor_w, np.asarray(sic_w, np.float32), deriv, desvio,
+    return np.stack([valor_w, deriv, desvio,
                      np.asarray(comp_w, np.float32), np.asarray(dcomp_w, np.float32)], axis=1)
 
 
@@ -164,18 +171,17 @@ def soft_peak(x, tau: float):
 
 
 # =============================================================================
-# 5. Treino do H0 (denoising multicanal, máscara de is_sicoi)
+# 5. Treino do H0 (denoising multicanal)
 # =============================================================================
 
-def _batch_input(valor_clean, sic, comp, dcomp, cfg, rng, contaminar=True):
+def _batch_input(valor_clean, comp, dcomp, cfg, rng, contaminar=True):
     vc = core.inject_contamination(valor_clean, cfg.base(), rng) if contaminar else valor_clean.copy()
-    canais = canais_de_janelas(vc, sic, comp, dcomp, cfg)      # [B,6,L]
+    canais = canais_de_janelas(vc, comp, dcomp, cfg)           # [B,5,L]
     alvo = valor_clean.astype(np.float32)
-    masc = (1.0 - np.asarray(sic, np.float32))                 # ignora manobra operacional
-    return canais, alvo, masc
+    return canais, alvo
 
 
-def train_h0_multi(valor_w, sic_w, comp_w, dcomp_w, cfg: ConfigMulti):
+def train_h0_multi(valor_w, comp_w, dcomp_w, cfg: ConfigMulti):
     """Treina o H0 multivariado. Todos [N,L] (comp_w/dcomp_w já normalizados)."""
     if not _TORCH_OK:
         raise RuntimeError("PyTorch indisponível.")
@@ -187,13 +193,12 @@ def train_h0_multi(valor_w, sic_w, comp_w, dcomp_w, cfg: ConfigMulti):
         ordem = rng.permutation(n)
         for b in range(0, n, cfg.batch_size):
             idx = ordem[b:b + cfg.batch_size]
-            ch, alvo, masc = _batch_input(valor_w[idx], sic_w[idx], comp_w[idx], dcomp_w[idx], cfg, rng)
+            ch, alvo = _batch_input(valor_w[idx], comp_w[idx], dcomp_w[idx], cfg, rng)
             xb = torch.from_numpy(ch).to(cfg.device)
             yb = torch.from_numpy(alvo).to(cfg.device)
-            mb = torch.from_numpy(masc).to(cfg.device)
             opt.zero_grad()
             pred = model(xb)
-            loss = (torch.abs(pred - yb) * mb).sum() / mb.sum().clamp_min(1.0)
+            loss = torch.abs(pred - yb).mean()   # L1 robusta: não persegue picos esparsos
             loss.backward(); opt.step()
     model.eval()
     return model
@@ -203,16 +208,15 @@ def train_h0_multi(valor_w, sic_w, comp_w, dcomp_w, cfg: ConfigMulti):
 # 6. Inferência: máxima anual (H0 ou H1)
 # =============================================================================
 
-def maxima_anual_multi(model, valor, is_sicoi, comp_full, dcomp_full, scaler, cfg: ConfigMulti) -> float:
+def maxima_anual_multi(model, valor, comp_full, dcomp_full, scaler, cfg: ConfigMulti) -> float:
     """comp_full/dcomp_full: já normalizados, alinhados ao vetor `valor`."""
     vn = scaler.transform(valor)
     vw = core.make_windows(vn, cfg.L, cfg.L)
-    sw = core.make_windows(np.asarray(is_sicoi, float), cfg.L, cfg.L)
     cw = core.make_windows(np.asarray(comp_full, float), cfg.L, cfg.L)
     dw = core.make_windows(np.asarray(dcomp_full, float), cfg.L, cfg.L)
     if vw.shape[0] == 0:
         return float("nan")
-    ch = canais_de_janelas(vw, sw, cw, dw, cfg)
+    ch = canais_de_janelas(vw, cw, dw, cfg)
     model.eval()
     with torch.no_grad():
         rec = model(torch.from_numpy(ch).to(cfg.device)).cpu().numpy().reshape(-1)
@@ -226,11 +230,16 @@ def maxima_anual_multi(model, valor, is_sicoi, comp_full, dcomp_full, scaler, cf
 
 def fine_tune_h1(model, rotulados: List[dict], pool: dict, cfg: ConfigMulti,
                  lam: float = 8.0, epochs: int = 40, lr: float = 5e-4,
-                 congelar_encoder: bool = True):
+                 congelar_encoder: bool = True, rot_batch: int = 16):
     """
-    rotulados: [{'canais':[Ndia,6,L] do valor REAL, 'V_norm': float}]  (V do especialista, normalizado)
-    pool: {'valor','sic','comp','dcomp'} [M,L] — amostra ampla p/ manter a reconstrução.
-    Perda = L_recon(mascarada por is_sicoi) + lam * |soft_peak(recon_ano) - V|.
+    rotulados: [{'canais':[Ndia,5,L] do valor REAL, 'V_norm': float}]  (V do especialista, normalizado)
+    pool: {'valor','comp','dcomp'} [M,L] — amostra ampla p/ manter a reconstrução.
+    Perda = L_recon + lam * |soft_peak(recon_ano) - V|.
+
+    `rot_batch`: nº de exemplos rotulados amostrados POR PASSO de gradiente.
+    Sem isso o custo por passo cresce O(n_rotulos) e o fine-tuning não escala
+    para os milhares de rótulos dos níveis altos de supervisão do protocolo
+    experimental.
     """
     if not _TORCH_OK:
         raise RuntimeError("PyTorch indisponível.")
@@ -242,19 +251,22 @@ def fine_tune_h1(model, rotulados: List[dict], pool: dict, cfg: ConfigMulti,
     M = pool["valor"].shape[0]; model.train()
     for _ in range(epochs):
         idx = rng.choice(M, size=min(cfg.batch_size, M), replace=False)
-        ch, alvo, masc = _batch_input(pool["valor"][idx], pool["sic"][idx],
-                                      pool["comp"][idx], pool["dcomp"][idx], cfg, rng)
+        ch, alvo = _batch_input(pool["valor"][idx], pool["comp"][idx], pool["dcomp"][idx], cfg, rng)
         xb = torch.from_numpy(ch).to(cfg.device); yb = torch.from_numpy(alvo).to(cfg.device)
-        mb = torch.from_numpy(masc).to(cfg.device)
         rec = model(xb)
-        L_rec = (torch.abs(rec - yb) * mb).sum() / mb.sum().clamp_min(1.0)
+        L_rec = torch.abs(rec - yb).mean()
 
+        # mini-batch de exemplos rotulados (amostrado a cada passo)
+        k = min(rot_batch, len(rotulados))
         L_exp = torch.zeros((), device=cfg.device)
-        for r in rotulados:
-            chy = torch.from_numpy(r["canais"].astype(np.float32)).to(cfg.device)
-            recy = model(chy).reshape(-1)
-            L_exp = L_exp + torch.abs(soft_peak(recy, cfg.tau) - float(r["V_norm"]))
-        L_exp = L_exp / max(1, len(rotulados))
+        if k > 0:
+            sel = rng.choice(len(rotulados), size=k, replace=False)
+            for j in sel:
+                r = rotulados[int(j)]
+                chy = torch.from_numpy(r["canais"].astype(np.float32)).to(cfg.device)
+                recy = model(chy).reshape(-1)
+                L_exp = L_exp + torch.abs(soft_peak(recy, cfg.tau) - float(r["V_norm"]))
+            L_exp = L_exp / k
 
         (L_rec + lam * L_exp).backward()
         opt.step(); opt.zero_grad()

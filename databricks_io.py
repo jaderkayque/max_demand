@@ -5,10 +5,10 @@ SÓ roda dentro do Databricks (usa Spark + dbutils). Não é importado pelo núc
 `core.py` nem pelo teste local. Credenciais SEMPRE via Databricks secrets — nunca
 em texto no código.
 
-Configure um scope de secrets (ex.: `james`) com as chaves:
-    sql_server, sql_db, sql_user, sql_pwd
+Configure um scope de secrets (ex.: `sqlserver`) com as chaves:
+    url, database, user, password
+(instale `pymssql` no notebook que usar `executar_sql_pymssql`)
 """
-%pip install pymssql
 
 from __future__ import annotations
 
@@ -42,7 +42,9 @@ def escrever_tabela(df, url, props, tabela: str, mode: str = "overwrite"):
        .option("driver", props["driver"]).mode(mode).save())
 
 
-def executar_sql_pymssql(sql, scope="sqlserver"):
+def executar_sql_pymssql(sql, dbutils, scope="sqlserver"):
+    """Executa T-SQL (ex.: MERGE) via pymssql. `dbutils` vem do notebook
+    chamador — módulos importados no Databricks não enxergam o global."""
     import pymssql
     conn = pymssql.connect(
         server=dbutils.secrets.get(scope, "url"),

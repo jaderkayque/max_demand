@@ -60,9 +60,18 @@ class Config:
 # =============================================================================
 
 class RobustScaler:
-    """Escala por mediana e IQR — robusto a picos de manobra."""
+    """Escala por mediana e intervalo interquantílico — robusto a picos.
 
-    def __init__(self) -> None:
+    `q_low`/`q_high` definem o intervalo usado como escala (padrão 25/75 = IQR
+    clássico). Mediana/IQR resistem a spikes, mas um platô de manobra SUSTENTADO
+    (semanas) desloca os quantis externos; nesse cenário um intervalo mais
+    interno (ex.: 30/70) é mais estável. É hiperparâmetro do protocolo
+    experimental — tunar em validação interna, nunca no teste.
+    """
+
+    def __init__(self, q_low: float = 25.0, q_high: float = 75.0) -> None:
+        self.q_low = q_low
+        self.q_high = q_high
         self.mediana: float = 0.0
         self.escala: float = 1.0
 
@@ -73,8 +82,8 @@ class RobustScaler:
             self.mediana, self.escala = 0.0, 1.0
             return self
         self.mediana = float(np.median(x))
-        q75, q25 = np.percentile(x, [75, 25])
-        iqr = float(q75 - q25)
+        qh, ql = np.percentile(x, [self.q_high, self.q_low])
+        iqr = float(qh - ql)
         self.escala = iqr if iqr > 1e-9 else (float(np.std(x)) or 1.0)
         return self
 
