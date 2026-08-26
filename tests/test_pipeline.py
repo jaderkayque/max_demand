@@ -12,7 +12,7 @@ Escopo honesto do H0: remove RUÍDO e ERROS DE MEDIÇÃO (picos) e transitórios
 curtos. Manobras SUSTENTADAS que parecem estruturais são o domínio do H1
 (conhecimento do especialista) — não se espera que o H0 as remova sozinho.
 
-Rodar:  python demanda_maxima/test_pipeline.py
+Rodar:  python tests/test_pipeline.py
 """
 
 import os
@@ -20,7 +20,7 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 import core  # noqa: E402
 
 

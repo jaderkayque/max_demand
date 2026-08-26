@@ -1,10 +1,14 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # nb_01 — Treino do H0 MULTIVARIADO (autoencoder denoising condicional)
+# MAGIC # nb_01 — Treino do H0 (autoencoder denoising condicional, multivariado)
 # MAGIC Canais por janela diária: **valor, derivada, desvio, comp, d_comp**
-# MAGIC (extensão mensal do circuito de `james.EXT_REDE_MT`).
-# MAGIC `is_sicoi` foi removido do pipeline (decisão de projeto) — sem máscara de
-# MAGIC perda; a perda é L1 simples. Salva o artefato p/ o nb_02.
+# MAGIC (extensão mensal do circuito, de `james.EXT_REDE_MT`).
+# MAGIC `is_sicoi` não é usado (decisão de projeto) — perda L1 simples, sem máscara.
+# MAGIC
+# MAGIC **Saída:** um arquivo NOVO em `modelo/ae_h0_multi_<AAAAMMDD_HHMMSS>.pt`.
+# MAGIC Nada é sobrescrito; o `nb_02` usa automaticamente o mais recente.
+# MAGIC
+# MAGIC Passo a passo, entradas e verificação: `docs/GUIA_USO.md`.
 
 # COMMAND ----------
 
@@ -12,36 +16,38 @@
 
 # COMMAND ----------
 
-import os, sys, datetime
+import os, sys
 import numpy as np
-from pyspark.sql.functions import lit
+import pandas as pd
+from pyspark.sql.functions import lit, rand
+from pyspark.sql.types import StructType, StructField, BinaryType
 
-sys.path.insert(0, "/Workspace/Shared/Servidores/Servidor SP/James/max_demand")
-import core, core_multi as cm            # noqa: E402
-import databricks_io_v2 as io               # noqa: E402
-
+dbutils.widgets.text("repo_dir", "/Workspace/Shared/Servidores/Servidor SP/James/max_demand")
 dbutils.widgets.text("medicao_path", "/Volumes/poseidon_uc/group_uc/ddpe/medicao/parquet")
 dbutils.widgets.text("grandeza", "IMAX")
 dbutils.widgets.text("n_alimentadores_amostra", "300")
 dbutils.widgets.text("max_janelas_por_grupo", "60")   # janelas (dias) por alimentador-ano
-dbutils.widgets.text("model_path", "/Workspace/Shared/Servidores/Servidor SP/James/max_demand/ae_h0_multi.pt")
 dbutils.widgets.text("secret_scope", "sqlserver")
 
-MEDICAO    = dbutils.widgets.get("medicao_path")
-GRANDEZA   = dbutils.widgets.get("grandeza")
-N_SAMPLE   = int(dbutils.widgets.get("n_alimentadores_amostra"))
+REPO_DIR    = dbutils.widgets.get("repo_dir")
+MEDICAO     = dbutils.widgets.get("medicao_path")
+GRANDEZA    = dbutils.widgets.get("grandeza")
+N_SAMPLE    = int(dbutils.widgets.get("n_alimentadores_amostra"))
 MAX_JANELAS = int(dbutils.widgets.get("max_janelas_por_grupo"))
-MODEL_PATH = dbutils.widgets.get("model_path")
-SCOPE      = dbutils.widgets.get("secret_scope")
+SCOPE       = dbutils.widgets.get("secret_scope")
+MODELO_DIR  = os.path.join(REPO_DIR, "modelo")
+
+sys.path.insert(0, os.path.join(REPO_DIR, "src"))
+import core, core_multi as cm            # noqa: E402
+import databricks_io as io               # noqa: E402
 
 cfg = cm.ConfigMulti(epochs=40, batch_size=256, seed=1)
-VERSAO = "ae_h0_multi_" + datetime.datetime.now().strftime("%Y%m%d_%H%M")
 
-import pandas as pd
 url, props = io.jdbc_conf(dbutils, SCOPE)
 # extensão MENSAL do circuito (km) + variação Δkm + stats globais (guardadas no cfg)
 COMP_MAP, DCOMP_MAP, cfg.comp_mean, cfg.comp_std, cfg.dcomp_std = io.carregar_ext_rede(spark, url, props)
 print(f"extensao: {len(COMP_MAP)} chaves | media={cfg.comp_mean:.2f} std={cfg.comp_std:.2f} dstd={cfg.dcomp_std:.2f}")
+
 
 def ler_alm(regiao):
     df = spark.read.parquet(f"{MEDICAO}/{regiao}/ALM").withColumn("regiao", lit(regiao))
@@ -62,8 +68,6 @@ med = ler_alm("SP").unionByName(ler_alm("ES"), allowMissingColumns=True)
 
 # amostra ALEATÓRIA de alimentadores, com semente registrada
 # (`.limit(N)` sem ordenação devolve "os N primeiros do Spark" — viés de seleção)
-from pyspark.sql.functions import rand
-from pyspark.sql.types import StructType, StructField, BinaryType
 ativos = [r.ativo for r in (med.select("ativo").distinct()
                                .orderBy(rand(seed=cfg.seed)).limit(N_SAMPLE).collect())]
 amostra = med.filter(med.ativo.isin(ativos))
@@ -73,7 +77,7 @@ win_schema = StructType([StructField("valor_w", BinaryType()),
                          StructField("dcomp_w", BinaryType())])
 
 def montar_janelas(pdf: pd.DataFrame) -> pd.DataFrame:
-    import numpy as _np, core_multi as _cm
+    import core_multi as _cm
     pdf = pdf.sort_values("DATAS")
     r = pdf.iloc[0]
     res = _cm.montar_janelas_grupo(pdf["valor"].to_numpy(float), pdf["DATAS"],
@@ -97,17 +101,33 @@ print("janelas de treino:", valor_w.shape, "| canais:", cfg.n_canais)
 
 # COMMAND ----------
 
-display(amostra)
-display(med)
-
-# COMMAND ----------
-
 # MAGIC %md ## 2. Treino do autoencoder denoising condicional (global)
 
 # COMMAND ----------
 
-model = cm.train_h0_multi( valor_w, comp_w, dcomp_w, cfg)
+model = cm.train_h0_multi(valor_w, comp_w, dcomp_w, cfg)
 
-os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)   # se /dbfs não acessível, use uma Volume
-cm.salvar_modelo(model, MODEL_PATH, cfg, VERSAO)          # cfg guarda comp_mean/comp_std
-print("modelo salvo:", MODEL_PATH, "versao", VERSAO)
+# grava um arquivo NOVO com timestamp — não sobrescreve treinos anteriores
+MODEL_PATH, VERSAO = cm.salvar_modelo_ts(model, MODELO_DIR, cfg, prefixo="ae_h0_multi")
+print("modelo salvo:", MODEL_PATH, "| versao:", VERSAO)
+
+# COMMAND ----------
+
+# MAGIC %md ## 3. Verificação (rodou corretamente?)
+# MAGIC Confere que o arquivo novo é o mais recente do diretório, que recarrega e
+# MAGIC que a arquitetura tem os 5 canais esperados.
+
+# COMMAND ----------
+
+_m, _cfg, _versao, _caminho = cm.carregar_modelo_mais_recente(MODELO_DIR, "ae_h0_multi", device="cpu")
+n_canais_reais = _m.enc[0].weight.shape[1]
+
+print("modelos no diretorio (antigo -> recente):")
+for ts, p in cm.listar_modelos(MODELO_DIR, "ae_h0_multi"):
+    print("  ", ts, os.path.basename(p))
+
+assert _caminho == MODEL_PATH, f"mais recente ({_caminho}) != salvo agora ({MODEL_PATH})"
+assert n_canais_reais == cfg.n_canais == 5, f"canais inesperados: {n_canais_reais}"
+assert np.isfinite([_cfg.comp_mean, _cfg.comp_std]).all(), "stats de extensao invalidas no cfg"
+print(f"\nOK — versao={_versao} | canais={n_canais_reais} | L={_cfg.L} | latente={_cfg.latent}")
+print(f"janelas usadas no treino: {valor_w.shape[0]}")

@@ -28,8 +28,11 @@ Núcleo puro (sem Spark). Reutiliza RobustScaler/make_windows/inject_contaminati
 
 from __future__ import annotations
 
+import datetime
+import os
+import re
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -309,22 +312,94 @@ def fine_tune_h1(model, rotulados: List[dict], pool: dict, cfg: ConfigMulti,
 
 
 # =============================================================================
-# 8. Persistência
+# 8. Persistência e VERSIONAMENTO por timestamp
 # =============================================================================
+#
+# Convenção: todo modelo treinado é gravado como
+#     <dir_modelos>/<prefixo>_<AAAAMMDD_HHMMSS>.pt
+# Nada é sobrescrito — cada treino gera um arquivo novo, e a inferência usa
+# por padrão o MAIS RECENTE. Assim dá para reproduzir/auditar qualquer rodada
+# antiga apontando o caminho exato.
+#
+# Prefixos usados: "ae_h0_multi" (H0) e "ae_h1_multi" (H1 fine-tuned).
+
+FMT_TS = "%Y%m%d_%H%M%S"
+# aceita 4 dígitos (HHMM, formato antigo) ou 6 (HHMMSS, formato atual)
+_RE_TS = re.compile(r"_(\d{8})_(\d{4}|\d{6})\.pt$")
+
+
+def _ts_ordenavel(nome: str) -> Optional[str]:
+    """Extrai o timestamp do nome como string comparável 'AAAAMMDDHHMMSS'.
+    Normaliza o formato antigo sem segundos para não quebrar a ordenação."""
+    m = _RE_TS.search(os.path.basename(nome))
+    if not m:
+        return None
+    data, hora = m.group(1), m.group(2)
+    return data + (hora if len(hora) == 6 else hora + "00")
+
+
+def listar_modelos(dir_modelos: str, prefixo: str = "ae_h0_multi") -> List[Tuple[str, str]]:
+    """Modelos do prefixo em `dir_modelos`, do mais ANTIGO ao mais RECENTE.
+    Devolve [(timestamp_ordenavel, caminho_completo)]."""
+    if not os.path.isdir(dir_modelos):
+        return []
+    achados = []
+    for nome in os.listdir(dir_modelos):
+        if not (nome.startswith(prefixo + "_") and nome.endswith(".pt")):
+            continue
+        ts = _ts_ordenavel(nome)
+        if ts:
+            achados.append((ts, os.path.join(dir_modelos, nome)))
+    return sorted(achados)
+
+
+def caminho_modelo_mais_recente(dir_modelos: str, prefixo: str = "ae_h0_multi") -> str:
+    """Caminho do modelo mais recente do prefixo. Erro claro se não houver."""
+    achados = listar_modelos(dir_modelos, prefixo)
+    if not achados:
+        raise FileNotFoundError(
+            f"nenhum modelo '{prefixo}_<AAAAMMDD_HHMMSS>.pt' em {dir_modelos!r}. "
+            f"Rode o notebook de treino correspondente antes da inferência.")
+    return achados[-1][1]
+
 
 def salvar_modelo(model, caminho: str, cfg: ConfigMulti, versao: str) -> None:
+    """Grava num caminho EXATO (uso interno; prefira `salvar_modelo_ts`)."""
     if not _TORCH_OK:
         raise RuntimeError("PyTorch indisponível.")
     torch.save({"state_dict": model.state_dict(), "cfg": cfg.__dict__, "versao": versao}, caminho)
 
 
+def salvar_modelo_ts(model, dir_modelos: str, cfg: ConfigMulti,
+                     prefixo: str = "ae_h0_multi", agora=None) -> Tuple[str, str]:
+    """Grava um modelo NOVO com timestamp (nunca sobrescreve).
+    Devolve (caminho, versao), onde versao == nome do arquivo sem '.pt'."""
+    agora = agora or datetime.datetime.now()
+    versao = f"{prefixo}_{agora.strftime(FMT_TS)}"
+    os.makedirs(dir_modelos, exist_ok=True)
+    caminho = os.path.join(dir_modelos, versao + ".pt")
+    salvar_modelo(model, caminho, cfg, versao)
+    return caminho, versao
+
+
 def carregar_modelo(caminho: str, device=None):
+    """Carrega de um caminho EXATO. Devolve (model, cfg, versao)."""
     if not _TORCH_OK:
         raise RuntimeError("PyTorch indisponível.")
-    ck = torch.load(caminho, map_location=device or "cpu")
+    ck = torch.load(caminho, map_location=device or "cpu", weights_only=False)
     cfg = ConfigMulti(**{k: v for k, v in ck["cfg"].items() if k in ConfigMulti().__dict__})
     if device:
         cfg.device = device
     model = DenoisingAECond(cfg).to(cfg.device)
     model.load_state_dict(ck["state_dict"]); model.eval()
     return model, cfg, ck.get("versao", "?")
+
+
+def carregar_modelo_mais_recente(dir_modelos: str, prefixo: str = "ae_h0_multi",
+                                 device=None):
+    """Carrega o modelo mais recente do prefixo.
+    Devolve (model, cfg, versao, caminho) — o caminho é devolvido para que o
+    driver possa FIXÁ-LO e repassar aos workers (ver nb_02/nb_03b)."""
+    caminho = caminho_modelo_mais_recente(dir_modelos, prefixo)
+    model, cfg, versao = carregar_modelo(caminho, device=device)
+    return model, cfg, versao, caminho

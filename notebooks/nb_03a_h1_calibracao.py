@@ -15,15 +15,18 @@
 # MAGIC %pip install numpy pandas pymssql
 
 # COMMAND ----------
-import sys
+import os, sys
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, "/Workspace/Repos/james/scripts_python/demanda_maxima")
-import databricks_io as io  # noqa: E402
-
-dbutils.widgets.text("secret_scope", "james")
+dbutils.widgets.text("repo_dir", "/Workspace/Shared/Servidores/Servidor SP/James/max_demand")
+# scope alinhado ao nb_01/nb_02 (chaves url/database/user/password)
+dbutils.widgets.text("secret_scope", "sqlserver")
+REPO_DIR = dbutils.widgets.get("repo_dir")
 SCOPE = dbutils.widgets.get("secret_scope")
+
+sys.path.insert(0, os.path.join(REPO_DIR, "src"))
+import databricks_io as io  # noqa: E402
 SEED = 42  # semente registrada — folds reprodutíveis
 url, props = io.jdbc_conf(dbutils, SCOPE)
 

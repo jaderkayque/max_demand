@@ -1,82 +1,91 @@
-# Demanda Máxima Estrutural — pipeline Databricks/PySpark
+# Demanda Máxima Estrutural
 
-Estima a **máxima demanda estrutural por ano** de cada alimentador (estado latente,
-sem manobras nem erros de medição) com um **autoencoder denoising 1D-CNN global**
-e grava no **SQL Server**, de onde o James (R) lê.
+Estima a **máxima demanda em regime normal de operação** de cada alimentador de
+distribuição, por ano — o valor que o engenheiro reconheceria como a ponta real
+da carga, sem os picos de erro de medição nem os patamares causados por manobras
+temporárias. Roda em Databricks/PySpark e grava no SQL Server, de onde o James (R) lê.
 
-> **Pesquisa (mestrado/ITA):** o desenho experimental, hipóteses, protocolo
-> anti-leakage e plano estatístico estão em `PLANO_PESQUISA_DISSERTACAO.md`.
-> Este pipeline é o sistema de produção/incumbente do estudo.
+> **Como rodar, entradas e verificação:** [`docs/GUIA_USO.md`](docs/GUIA_USO.md).
+> **Pesquisa (mestrado/ITA):** [`docs/PLANO_PESQUISA_DISSERTACAO.md`](docs/PLANO_PESQUISA_DISSERTACAO.md)
+> — hipóteses, desenho experimental, protocolo anti-leakage e plano estatístico.
+> Este pipeline é o sistema de produção e o método incumbente do estudo.
 
-> **Decisão de projeto:** o flag `is_sicoi` foi **removido** de todo o pipeline
-> (canais e máscara de perda). Os canais multivariados são: valor, derivada,
-> desvio local, extensão da rede (`comp`) e variação mensal da extensão (`d_comp`).
-
-## Componentes
-
-| Arquivo | Onde roda | Papel |
-|---|---|---|
-| `core.py` | qualquer lugar (sem Spark) | modelo univariado, normalização robusta, treino, `maxima_anual`. Testável. |
-| `core_multi.py` | qualquer lugar (sem Spark) | H0 multivariado (5 canais) + fine-tuning H1 (`soft_peak`, mini-batch de rótulos). |
-| `databricks_io.py` / `databricks_io_v2.py` | Databricks | JDBC/secrets: ler/escrever SQL Server, `MERGE`; v2 tem `carregar_ext_rede`. |
-| `nb_01_treino_h0.py` / `_v2` | Databricks | treina o modelo global (H0; v2 = multivariado), amostra **aleatória com semente**, salva artefato. |
-| `nb_02_predict_max.py` / `_v2` | Databricks | máxima anual por alimentador → `james.DEMANDA_MAXIMA` (H0). |
-| `nb_03_treino_h1.py` | Databricks | calibração com rótulos do especialista + **CV agrupada por alimentador (out-of-sample)** → `demanda_max_h1`. |
-| `nb_03_treino_h1_finetune.py` | Databricks | H1 por retreino da rede (fine-tuning com perda de quantil anual). |
-| `test_pipeline.py` / `test_finetune.py` | local | testes sintéticos do núcleo (sem Spark). |
-
-## Fluxo
+## Estrutura
 
 ```
-Medição (parquet no lakehouse)
-   │  nb_01_treino_h0  ──►  ae_h0.pt (DBFS)
-   │  nb_02_predict_max ──► james.DEMANDA_MAXIMA (demanda_max_h0)   ◄── R lê
-   ▼
-James (R): engenheiro clica no gráfico o valor correto → INSERT em
-           james.DEMANDA_MAXIMA_TREINO
-   │
-   │  nb_03_treino_h1  ──► james.DEMANDA_MAXIMA (demanda_max_h1)     ◄── R lê
+src/         núcleo Python (sem Spark) — importado pelos notebooks e pelos testes
+notebooks/   os 4 notebooks Databricks, na ordem de execução
+modelo/      modelos treinados, um arquivo por rodada, com timestamp
+tests/       testes sintéticos locais (não precisam de Spark nem de cluster)
+docs/        guia de uso e plano de pesquisa
+sql/         consultas Databricks auxiliares (origem da extensão de rede)
 ```
 
-## Pré-requisitos
+| Arquivo | Papel |
+|---|---|
+| `src/core.py` | normalização robusta, janelamento, autoencoder base, contaminação sintética |
+| `src/core_multi.py` | H0 multivariado (5 canais), fine-tuning H1, **versionamento dos modelos** |
+| `src/databricks_io.py` | JDBC/secrets, leitura da extensão de rede, `MERGE` via pymssql |
+| `notebooks/nb_01_treino_h0.py` | treina o H0 → `modelo/ae_h0_multi_<ts>.pt` |
+| `notebooks/nb_02_predict_max.py` | aplica o H0 a todos os alimentadores → `demanda_max_h0` |
+| `notebooks/nb_03a_h1_calibracao.py` | H1 por calibração linear sobre os rótulos (baseline rápida) |
+| `notebooks/nb_03b_h1_finetune.py` | H1 por retreino da rede (abordagem principal) → `demanda_max_h1` |
 
-1. Rodar `../../sql/schema.sql` no SQL Server (cria `james.DEMANDA_MAXIMA` e
-   `james.DEMANDA_MAXIMA_TREINO`).
-2. Criar um **secret scope** no Databricks (ex.: `james`) com:
-   `sql_server`, `sql_db`, `sql_user`, `sql_pwd`. **Nunca** coloque senha no código.
-3. Ajustar os widgets dos notebooks: `medicao_path` (base parquet), `grandeza`
-   (default `MVA`), `model_path`, `secret_scope`, e o caminho de import de
-   `demanda_maxima` (Repos/Workspace).
+## Como funciona
 
-## Execução (ordem)
+A série observada é tratada como `carga estrutural + manobras + erro de medição`.
+Um autoencoder denoising 1D-CNN global reconstrói a componente estrutural, e a
+máxima anual é um quantil alto dessa reconstrução. O modelo aprende a descartar
+o que não é estrutural por três mecanismos: o gargalo não consegue representar
+picos esparsos, a perda L1 não persegue desvios grandes e isolados, e durante o
+treino injetamos contaminação sintética na entrada pedindo a curva limpa de volta.
 
-1. `nb_01_treino_h0` — treina o H0 (rodar quando quiser reajustar o modelo).
-2. `nb_02_predict_max` — recalcula todas as máximas H0 (ex.: agendado, após o sync).
-3. (depois que os engenheiros salvarem valores no James) `nb_03_treino_h1` — H1.
+**Canais de entrada (5):** valor, derivada, desvio local, extensão da rede (`comp`)
+e sua variação mensal (`d_comp`). A ideia causal é que um Δkm grande sinaliza
+reconfiguração **permanente** — mudança estrutural que deve ser preservada —
+enquanto perturbações sem contrapartida topológica são candidatas a transitório.
+
+**`is_sicoi` não é usado** (decisão de projeto): não há canal de manobra nem
+máscara de perda. Sem esse sinal explícito, separar evento temporário de mudança
+estrutural depende do objetivo denoising, dos canais topológicos e da supervisão
+do especialista.
+
+**Escopo honesto do H0:** remove ruído, erros de medição e transitórios curtos.
+Manobras **sustentadas** que se parecem com carga estrutural são o domínio do
+**H1**, onde entra o conhecimento do engenheiro.
+
+## Modelos versionados
+
+Cada treino grava um arquivo novo — `modelo/ae_h0_multi_<AAAAMMDD_HHMMSS>.pt` —
+e nada é sobrescrito. A inferência usa por padrão o mais recente; para reproduzir
+uma rodada antiga basta apontar o widget `model_path` para o arquivo desejado.
+A versão é gravada dentro do `.pt` e na coluna `modelo_versao` da tabela de
+resultado, então cada número no banco é rastreável até o modelo que o produziu.
+
+## Regras de avaliação
+
+Valem tanto para produção quanto para a dissertação:
+
+- Métricas **sempre out-of-sample** — validação cruzada agrupada por alimentador
+  (nb_03a) ou teste congelado por alimentador (protocolo da pesquisa). Anos do
+  mesmo alimentador são correlacionados e nunca podem ficar em lados opostos do
+  split. A regra de produção "onde há rótulo, usa o valor exato" jamais entra em
+  avaliação.
+- Amostragens de alimentadores sempre **aleatórias com semente registrada**,
+  nunca `.limit(N)` puro do Spark, que devolve "os primeiros que aparecerem".
+- `prob_max`, `q_low`/`q_high` do scaler, `lam` e `tau` são hiperparâmetros:
+  ajustar em validação interna, nunca contra o conjunto de teste.
 
 ## Teste local
 
 ```bash
 pip install -r requirements.txt
-python test_pipeline.py
 ```
 
-Valida que a máxima do sinal latente **remove os picos de medição** e se aproxima
-da verdade (o modelo real é treinado no Databricks sobre a base completa).
+```bash
+python tests/test_versionamento.py
+```
 
-> Escopo honesto do H0: remove ruído/erros de medição e transitórios curtos.
-> Manobras **sustentadas** que parecem estruturais são o domínio do **H1**
-> (conhecimento do especialista). Sem `is_sicoi`, a separação entre evento
-> operacional temporário e mudança estrutural depende apenas do objetivo
-> denoising, dos canais topológicos (`comp`/`d_comp`) e da supervisão do
-> especialista.
-
-## Regras de avaliação (resumo do protocolo de pesquisa)
-
-- Métricas **sempre out-of-sample**: CV agrupada por alimentador (nb_03) ou
-  teste congelado por alimentador (protocolo da dissertação). A regra de
-  produção "onde há rótulo, usa o valor exato" nunca entra em avaliação.
-- Amostragens de alimentadores sempre **aleatórias com semente registrada**
-  (nunca `.limit(N)` puro do Spark).
-- `prob_max`, `q_low`/`q_high` do scaler, `lam`, `tau` são hiperparâmetros:
-  tunar em validação interna, nunca no teste.
+Os outros dois (`tests/test_pipeline.py` e `tests/test_finetune.py`) treinam
+redes pequenas em dados sintéticos e levam alguns minutos. Detalhes do que cada
+um garante estão no [guia de uso](docs/GUIA_USO.md#7-testes-locais-sem-spark-sem-databricks).

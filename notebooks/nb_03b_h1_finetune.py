@@ -23,32 +23,33 @@
 # MAGIC %pip install torch numpy pandas pymssql
 
 # COMMAND ----------
-import sys
+import os, sys
 import numpy as np
 import pandas as pd
 from pyspark.sql.functions import lit, rand
 from pyspark.sql.types import (StructType, StructField, StringType, IntegerType,
                                DoubleType, BinaryType)
 
-sys.path.insert(0, "/Workspace/Repos/james/scripts_python/demanda_maxima")
-import core, core_multi as cm            # noqa: E402
-import databricks_io_v2 as io            # noqa: E402  (tem carregar_ext_rede)
-
+dbutils.widgets.text("repo_dir", "/Workspace/Shared/Servidores/Servidor SP/James/max_demand")
 dbutils.widgets.text("medicao_path", "/Volumes/poseidon_uc/group_uc/ddpe/medicao/parquet")
 dbutils.widgets.text("grandeza", "MVA")
-dbutils.widgets.text("model_h0_path", "/dbfs/FileStore/james/demanda_maxima/ae_h0_multi.pt")
-dbutils.widgets.text("model_h1_path", "/dbfs/FileStore/james/demanda_maxima/ae_h1_multi.pt")
-dbutils.widgets.text("secret_scope", "james")
+dbutils.widgets.text("model_h0_path", "")   # vazio = usa o H0 mais recente de modelo/
+dbutils.widgets.text("secret_scope", "sqlserver")
 dbutils.widgets.text("n_pool", "200")
 dbutils.widgets.text("max_janelas_pool", "40")   # janelas (dias) por alimentador-ano do pool
 
+REPO_DIR  = dbutils.widgets.get("repo_dir")
 MEDICAO   = dbutils.widgets.get("medicao_path")
 GRANDEZA  = dbutils.widgets.get("grandeza")
-H0_PATH   = dbutils.widgets.get("model_h0_path")
-H1_PATH   = dbutils.widgets.get("model_h1_path")
+H0_PATH   = dbutils.widgets.get("model_h0_path").strip()
 SCOPE     = dbutils.widgets.get("secret_scope")
 N_POOL    = int(dbutils.widgets.get("n_pool"))
 MAX_JANELAS_POOL = int(dbutils.widgets.get("max_janelas_pool"))
+MODELO_DIR = os.path.join(REPO_DIR, "modelo")
+
+sys.path.insert(0, os.path.join(REPO_DIR, "src"))
+import core, core_multi as cm            # noqa: E402
+import databricks_io as io               # noqa: E402
 
 url, props = io.jdbc_conf(dbutils, SCOPE)
 
@@ -63,7 +64,11 @@ def ler_alm(regiao):
 # MAGIC %md ## 1. Carrega o H0 multivariado e os rótulos do especialista
 
 # COMMAND ----------
-model, cfg, _ = cm.carregar_modelo(H0_PATH, device="cpu")
+# resolve o H0 UMA VEZ no driver (vazio = mais recente de modelo/)
+if not H0_PATH:
+    H0_PATH = cm.caminho_modelo_mais_recente(MODELO_DIR, "ae_h0_multi")
+model, cfg, versao_h0 = cm.carregar_modelo(H0_PATH, device="cpu")
+print("H0 de partida:", H0_PATH, "| versao:", versao_h0)
 
 # extensão MENSAL do circuito (canais comp/d_comp), normalizada com as stats do modelo
 COMP_MAP, DCOMP_MAP, _, _, _ = io.carregar_ext_rede(spark, url, props)
@@ -144,9 +149,10 @@ pool = {"valor": _des("valor_w"), "comp": _des("comp_w"), "dcomp": _des("dcomp_w
 
 model_h1 = cm.fine_tune_h1(model, rotulados, pool, cfg,
                            lam=8.0, epochs=60, lr=5e-4, rot_batch=16)
-VERSAO = "ae_h1_" + pd.Timestamp.now().strftime("%Y%m%d_%H%M")
-cm.salvar_modelo(model_h1, H1_PATH, cfg, VERSAO)
-print("H1 salvo:", H1_PATH, VERSAO)
+
+# grava um arquivo NOVO com timestamp — não sobrescreve H1 anteriores
+H1_PATH, VERSAO = cm.salvar_modelo_ts(model_h1, MODELO_DIR, cfg, prefixo="ae_h1_multi")
+print("H1 salvo:", H1_PATH, "| versao:", VERSAO)
 
 # COMMAND ----------
 # MAGIC %md ## 4. Recalcula a máxima H1 de TODOS os alimentadores (rede retreinada)
@@ -193,3 +199,33 @@ USING james.DEMANDA_MAXIMA_H1_STG AS s
 WHEN MATCHED THEN UPDATE SET d.demanda_max_h1 = s.demanda_max_h1, d.calculado_em = GETDATE();
 """, dbutils, scope=SCOPE)
 print("H1 (rede retreinada) gravado em james.DEMANDA_MAXIMA")
+
+# COMMAND ----------
+# MAGIC %md ## 6. Verificação (rodou corretamente?)
+# MAGIC Confere que o H1 novo é o mais recente, que o fine-tuning de fato MUDOU o
+# MAGIC modelo (H1 ≠ H0) e que o H1 ficou mais perto dos rótulos do especialista.
+# MAGIC
+# MAGIC ⚠️ Esta comparação é IN-SAMPLE (usa os pares que supervisionaram o retreino):
+# MAGIC serve como *sanity check* de produção, **não** como métrica de desempenho.
+# MAGIC Métrica honesta exige teste congelado — ver `docs/PLANO_PESQUISA_DISSERTACAO.md`.
+
+# COMMAND ----------
+print("modelos H1 no diretorio (antigo -> recente):")
+for ts, p in cm.listar_modelos(MODELO_DIR, "ae_h1_multi"):
+    print("  ", ts, os.path.basename(p))
+assert cm.caminho_modelo_mais_recente(MODELO_DIR, "ae_h1_multi") == H1_PATH
+
+dm = io.ler_tabela(spark, url, props, "james.DEMANDA_MAXIMA").toPandas()
+lb_chk = lb.rename(columns={"valor_correto": "real"})
+cmp = dm.merge(lb_chk[["regiao", "ativo", "ano", "real"]], on=["regiao", "ativo", "ano"], how="inner")
+cmp = cmp.dropna(subset=["real", "demanda_max_h0", "demanda_max_h1"])
+
+if len(cmp):
+    err_h0 = (cmp["demanda_max_h0"] - cmp["real"]).abs() / cmp["real"].abs()
+    err_h1 = (cmp["demanda_max_h1"] - cmp["real"]).abs() / cmp["real"].abs()
+    print(f"\npares rotulados comparados: {len(cmp)}  (IN-SAMPLE)")
+    print(f"erro relativo mediano  H0: {err_h0.median():.2%}   H1: {err_h1.median():.2%}")
+    print(f"dentro de 10%          H0: {(err_h0 <= .10).mean():.1%}   H1: {(err_h1 <= .10).mean():.1%}")
+    print("esperado: H1 melhor que H0 nestes pares; se nao for, revise lam/epochs.")
+else:
+    print("\nsem pares rotulados para comparar — verifique james.DEMANDA_MAXIMA_TREINO")

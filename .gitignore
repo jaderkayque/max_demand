@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Os modelos treinados (modelo/*.pt) SÃO versionados de propósito:
+# cada rodada gera um arquivo novo com timestamp e o histórico é o registro
+# de auditoria das versões usadas em produção.

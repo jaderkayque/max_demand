@@ -7,13 +7,13 @@ O H0 não deve tratá-lo como estrutural, mas a rede o segue em parte -> superes
 a máxima. O engenheiro informa o valor correto V; o fine-tuning com a perda de
 quantil anual puxa a máxima do H1 para perto de V.
 
-Rodar: python demanda_maxima/test_finetune.py
+Rodar: python tests/test_finetune.py
 """
 
 import os, sys, copy
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 import core, core_multi as cm
 
 

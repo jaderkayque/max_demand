@@ -3,7 +3,7 @@
 
 > Documento de trabalho para dissertação de mestrado (ITA).
 > Elaborado a partir da proposta do autor e da leitura do código existente no repositório
-> (`core.py`, `core_multi.py`, `nb_01…nb_03`, testes locais).
+> (`src/core.py`, `src/core_multi.py`, `notebooks/nb_01…nb_03b`, testes locais).
 >
 > **Decisão de projeto (2026-08-16): o flag `is_sicoi` foi descartado** — não será
 > usado como canal, máscara de perda nem baseline. Consequências incorporadas ao
@@ -20,15 +20,15 @@ Antes da crítica, o registro do que existe — porque a dissertação deve nasc
 
 - **H0 (não supervisionado)**: autoencoder denoising 1D-CNN, janelas diárias (L=144 @ 10 min), normalização robusta (mediana/IQR) por alimentador-ano, contaminação sintética (platôs e spikes) no treino, máxima anual = quantil 0,999 da reconstrução (`core.py`).
 - **H0 multivariado**: 5 canais (valor, derivada, desvio local, `comp`, `d_comp`), perda L1 simples (`core_multi.py`). *(Originalmente havia um 6º canal `is_sicoi` com máscara de perda — removido por decisão de projeto.)*
-- **H1 (duas variantes)**: (a) calibração linear global `h1 = a·h0 + b` sobre os pares rotulados (`nb_03_treino_h1.py`); (b) fine-tuning da rede com perda de quantil anual `soft_peak` (`nb_03_treino_h1_finetune.py`).
+- **H1 (duas variantes)**: (a) calibração linear global `h1 = a·h0 + b` sobre os pares rotulados (`notebooks/nb_03a_h1_calibracao.py`); (b) fine-tuning da rede com perda de quantil anual `soft_peak` (`notebooks/nb_03b_h1_finetune.py`).
 - **Loop humano**: engenheiro rotula no James (R) → `DEMANDA_MAXIMA_TREINO` → retreino.
 
 Observações técnicas pontuais que afetam a pesquisa (não são apenas "bugs de engenharia"):
 
-1. **A calibração do `nb_03` é avaliada in-sample.** O ajuste `polyfit` usa todos os pares rotulados e, onde há rótulo, copia o valor exato do especialista. Qualquer métrica calculada sobre esses pares é circular. No desenho experimental, *toda* avaliação precisa ser out-of-sample por construção.
-2. **A amostragem de alimentadores usa `.limit(N)` do Spark** (`nb_01_v2`, `nb_03_finetune`) — isso não é amostra aleatória; é "os N primeiros que o Spark devolver". Para a dissertação, amostragem deve ser aleatória com semente registrada.
+1. **A calibração do `nb_03a` era avaliada in-sample.** O ajuste `polyfit` usa todos os pares rotulados e, onde há rótulo, copia o valor exato do especialista. Qualquer métrica calculada sobre esses pares é circular. *(Já corrigido: o notebook agora reporta validação cruzada agrupada por alimentador, e a regra de produção roda depois da avaliação.)* No desenho experimental, *toda* avaliação precisa ser out-of-sample por construção.
+2. **A amostragem de alimentadores usava `.limit(N)` do Spark** (`nb_01`, `nb_03b`) — isso não é amostra aleatória; é "os N primeiros que o Spark devolver". *(Já corrigido no código para amostragem aleatória com semente registrada; mantido aqui porque a distinção precisa constar na metodologia.)*
 3. **`fine_tune_h1` itera sobre *todos* os exemplos rotulados a cada passo de gradiente** — O(n_rótulos) por batch. Funciona com dezenas de rótulos; não escala para os milhares que o experimento de 100% de supervisão vai exigir. Precisa virar mini-batch sobre os rotulados.
-4. **O `RobustScaler` é ajustado no ano inteiro, incluindo os períodos anômalos.** Mediana/IQR resistem a spikes, mas um platô de manobra de 70 dias (como no próprio `test_finetune.py`) desloca o IQR. Vale testar escalonamento por quantis mais internos (o `RobustScaler` agora aceita `q_low`/`q_high` como hiperparâmetros).
+4. **O `RobustScaler` é ajustado no ano inteiro, incluindo os períodos anômalos.** Mediana/IQR resistem a spikes, mas um platô de manobra de 70 dias (como no próprio `tests/test_finetune.py`) desloca o IQR. Vale testar escalonamento por quantis mais internos (o `RobustScaler` agora aceita `q_low`/`q_high` como hiperparâmetros).
 5. **`prob_max = 0,999` é um hiperparâmetro que define diretamente a resposta.** Ele precisa entrar no protocolo de tuning aninhado (ver §5.6), senão vira um botão implícito calibrado no olho contra o teste.
 6. **`d_comp` é mensal e o sinal é de 10 min** — o canal topológico só enxerga reconfigurações que sobrevivem à fotografia mensal do cadastro. Isso deve ser declarado como limitação de observabilidade, não escondido.
 
@@ -313,7 +313,7 @@ Ponto metodológico crítico: **não** declarar saturação porque um teste de d
 2. **Ancoragem dos rótulos históricos no H0** (§1.2) — risco alto se o James exibia a predição; investigar e declarar; a validação cega de 2026 é o antídoto.
 3. **Descarte do `is_sicoi`** — decisão de projeto que remove o único sinal explícito de manobra operacional. Consequência: o modelo precisa inferir "evento temporário" apenas da forma da série e da topologia, o que tende a exigir mais rótulos (deslocamento da curva de aprendizado — em si um resultado reportável). Declarar a motivação do descarte (confiabilidade/cobertura do flag) na dissertação.
 4. **2020 (COVID) é ano atípico** — verificar se os rótulos de 2020 se comportam diferente; considerar análise de sensibilidade excluindo-o.
-5. **Dados proprietários** — reprodutibilidade limitada; mitigar com código aberto + gerador sintético calibrado (o `test_finetune.py` já aponta o caminho) e, se possível, amostra anonimizada.
+5. **Dados proprietários** — reprodutibilidade limitada; mitigar com código aberto + gerador sintético calibrado (o `tests/test_finetune.py` já aponta o caminho) e, se possível, amostra anonimizada.
 6. **Generalização institucional** — dois estados da mesma controladora; curvas podem não transferir para outras distribuidoras (declarar escopo).
 7. **Risco de cronograma** — a matriz método × nível × repetição explode; o piloto (§5.3) existe para podar. Prioridade se faltar tempo: baselines + M2 + M3/M4 + estatística bem-feita > mais métodos.
 
