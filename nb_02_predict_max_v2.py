@@ -18,13 +18,13 @@ import pandas as pd
 from pyspark.sql.functions import lit
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType
 
-sys.path.insert(0, "/Workspace/Shared/Servidores/Servidor SP/James/ML_Demanda_Maxima")
+sys.path.insert(0, "/Workspace/Shared/Servidores/Servidor SP/James/max_demand")
 import core, core_multi as cm            # noqa: E402
 import databricks_io_v2 as io               # noqa: E402
 
 dbutils.widgets.text("medicao_path", "/Volumes/poseidon_uc/group_uc/ddpe/medicao/parquet")
 dbutils.widgets.text("grandeza", "MVA")
-dbutils.widgets.text("model_path", "/Workspace/Shared/Servidores/Servidor SP/James/ML_Demanda_Maxima/ae_h0_multi.pt")
+dbutils.widgets.text("model_path", "/Workspace/Shared/Servidores/Servidor SP/James/max_demand/ae_h0_multi.pt")
 dbutils.widgets.text("secret_scope", "sqlserver")
 
 MEDICAO    = dbutils.widgets.get("medicao_path")

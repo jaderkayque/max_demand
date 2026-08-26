@@ -16,7 +16,7 @@ import os, sys, datetime
 import numpy as np
 from pyspark.sql.functions import lit
 
-sys.path.insert(0, "/Workspace/Shared/Servidores/Servidor SP/James/ML_Demanda_Maxima")
+sys.path.insert(0, "/Workspace/Shared/Servidores/Servidor SP/James/max_demand")
 import core, core_multi as cm            # noqa: E402
 import databricks_io_v2 as io               # noqa: E402
 
@@ -24,7 +24,7 @@ dbutils.widgets.text("medicao_path", "/Volumes/poseidon_uc/group_uc/ddpe/medicao
 dbutils.widgets.text("grandeza", "IMAX")
 dbutils.widgets.text("n_alimentadores_amostra", "300")
 dbutils.widgets.text("max_janelas_por_grupo", "60")   # janelas (dias) por alimentador-ano
-dbutils.widgets.text("model_path", "/Workspace/Shared/Servidores/Servidor SP/James/ML_Demanda_Maxima/ae_h0_multi.pt")
+dbutils.widgets.text("model_path", "/Workspace/Shared/Servidores/Servidor SP/James/max_demand/ae_h0_multi.pt")
 dbutils.widgets.text("secret_scope", "sqlserver")
 
 MEDICAO    = dbutils.widgets.get("medicao_path")
@@ -97,11 +97,16 @@ print("janelas de treino:", valor_w.shape, "| canais:", cfg.n_canais)
 
 # COMMAND ----------
 
+display(amostra)
+display(med)
+
+# COMMAND ----------
+
 # MAGIC %md ## 2. Treino do autoencoder denoising condicional (global)
 
 # COMMAND ----------
 
-model = cm.train_h0_multi(valor_w, comp_w, dcomp_w, cfg)
+model = cm.train_h0_multi( valor_w, comp_w, dcomp_w, cfg)
 
 os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)   # se /dbfs não acessível, use uma Volume
 cm.salvar_modelo(model, MODEL_PATH, cfg, VERSAO)          # cfg guarda comp_mean/comp_std
